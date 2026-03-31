@@ -1,131 +1,140 @@
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-import pandas as ps
-import numpy as np
 import torch
-import seaborn as sns
-import itertools
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
 from tqdm.auto import tqdm
 
-data_distribution = torch.distributions.mixture_same_family.MixtureSameFamily(
-    torch.distributions.Categorical(torch.tensor([1,2])),
-    torch.distributions.Normal(torch.tensor([-4., 4.]), torch.tensor([1., 1.]))
-)
+### Data Loading -- Using MNIST Data
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
 
-dataset = data_distribution.sample(torch.Size([1000, 1]))
-sns.histplot(dataset[:, 0])
+train_data   = datasets.MNIST('./data', train=True, download=True, transform=transform)
+train_loader = DataLoader(train_data, batch_size=128, shuffle=True, num_workers=0)
+
+# Visualise a few training images to confirm loading.
+sample_batch, _ = next(iter(train_loader))
+grid = make_grid(sample_batch[:16], nrow=4, normalize=True)
+plt.figure(figsize=(4, 4))
+plt.imshow(grid.permute(1, 2, 0), cmap='gray')
+plt.axis('off')
+plt.title('Training samples')
 plt.show()
 
-TIME_STEPS = 250
-BETA = 0.02
+### Noise Schedule
+TIME_STEPS = 1000
+BETA_START = 1e-4
+BETA_END   = 0.02
 
-def do_diffusion(data, steps=TIME_STEPS, beta=BETA):
-    # perform diffusion following equation 2
-    # returns a list of q(x(t)) and x(t)
-    # starting from t=0 (i.e., the dataset)
-    
-    distributions, samples = [None], [data]
-    xt = data
-    for t in range(steps):
-        q = torch.distributions.Normal(
-            np.sqrt(1 - beta) * xt,
-            np.sqrt(beta)
-        )
-        xt = q.sample()
+betas      = torch.linspace(BETA_START, BETA_END, TIME_STEPS)  # β_t
+alphas     = 1.0 - betas                                         # 1 - β_t
+alpha_bars = torch.cumprod(alphas, dim=0)                        # α_t = ∏(1-β_τ)
 
-        distributions.append(q)
-        samples.append(xt)
-    
-    return distributions, samples
+### Diffusion Kernel
+def sample_zt(x, t):
+    alpha_bar_t = alpha_bars[t].view(-1, 1, 1, 1)
+    eps = torch.randn_like(x)
+    zt  = torch.sqrt(alpha_bar_t) * x + torch.sqrt(1.0 - alpha_bar_t) * eps
+    return zt, eps
 
-_, samples = do_diffusion(dataset)
+### Noise Model
+IMAGE_DIM = 28 * 28  # 784
 
-for t in torch.stack(samples)[:, :, 0].T[:100]:
-    plt.plot(t, c='navy', alpha=0.1)
-plt.xlabel('Diffusion time')
-plt.ylabel('Data')
-plt.show()
-
-def compute_loss(forward_distributions, forward_samples, mean_model, var_model):
-    p = torch.distributions.Normal(
-        torch.zeros(forward_samples[0].shape),
-        torch.ones(forward_samples[0].shape)
-    )
-    loss = -p.log_prob(forward_samples[-1]).mean()
-
-    for t in range(1, len(forward_samples)):
-        xt = forward_samples[t]
-        xprev = forward_samples[t - 1]
-        q = forward_distributions[t]
-
-        xin = torch.cat(
-            (xt, (t / len(forward_samples)) * torch.ones(xt.shape[0], 1)),
-            dim=1
+class NoiseModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(IMAGE_DIM + 1, 512), nn.ReLU(),
+            nn.Linear(512, 512),           nn.ReLU(),
+            nn.Linear(512, IMAGE_DIM)
         )
 
-        mu = mean_model(xin)
-        sigma = var_model(xin)
-        p = torch.distributions.Normal(mu, sigma)
+    def forward(self, x, t):
+        # Flatten image and append normalised timestep as a scalar feature.
+        x_flat = x.view(x.shape[0], -1)                        # (B, 784)
+        t_norm = (t.float() / TIME_STEPS).unsqueeze(1)         # (B, 1)
+        xin    = torch.cat([x_flat, t_norm], dim=1)            # (B, 785)
+        return self.net(xin).view(x.shape)                      # (B, 1, 28, 28)
 
-        loss -= torch.mean(p.log_prob(xprev))
-        loss += torch.mean(q.log_prob(xt))
-    return loss / len(forward_samples)
+### Setup
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-mean_model = torch.nn.Sequential(
-    torch.nn.Linear(2, 4), torch.nn.ReLU(),
-    torch.nn.Linear(4, 1)
-)
-var_model = torch.nn.Sequential(
-    torch.nn.Linear(2, 4), torch.nn.ReLU(),
-    torch.nn.Linear(4, 1), torch.nn.Softplus()
-)
+betas      = betas.to(device)
+alphas     = alphas.to(device)
+alpha_bars = alpha_bars.to(device)
 
-optim = torch.optim.AdamW(
-    itertools.chain(mean_model.parameters(), var_model.parameters()),
-    lr=1e-2, weight_decay=1e-6,
-)
+noise_model = NoiseModel().to(device)
+optim = torch.optim.AdamW(noise_model.parameters(), lr=2e-4, weight_decay=1e-4)
 
+### Training Loop
+EPOCHS = 10
 loss_history = []
-bar = tqdm(range(1000))
-for e in bar:
-    forward_distributions, forward_samples = do_diffusion(dataset)
 
-    optim.zero_grad()
-    loss = compute_loss(
-        forward_distributions, forward_samples, mean_model, var_model
-    )
-    loss.backward()
-    optim.step()
+for epoch in range(EPOCHS):
+    epoch_losses = []
+    bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{EPOCHS}')
 
-    bar.set_description(f'Loss: {loss.item():.4f}')
-    loss_history.append(loss.item())
+    for x, _ in bar:
+        x = x.to(device)
+        t = torch.randint(0, TIME_STEPS, (x.shape[0],), device=device)
+        zt, eps  = sample_zt(x, t)
+        eps_pred = noise_model(zt, t)
+
+        loss = F.mse_loss(eps_pred, eps)
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+
+        epoch_losses.append(loss.item())
+        bar.set_postfix(loss=f'{loss.item():.4f}')
+
+    mean_loss = float(np.mean(epoch_losses))
+    loss_history.append(mean_loss)
+    print(f'Epoch {epoch+1}: mean loss = {mean_loss:.4f}')
 
 plt.plot(loss_history)
-plt.yscale('log')
 plt.ylabel('Loss')
-plt.xlabel('Training step')
+plt.xlabel('Epoch')
+plt.title('Training loss')
 plt.show()
 
-def sample_reverse(mean_model, var_model, count, steps=TIME_STEPS):
-    p = torch.distributions.Normal(torch.zeros(count, 1), torch.ones(count, 1))
-    xt = p.sample()
-    sample_history = [xt]
-    for t in range(steps, 0, -1):
-        xin = torch.cat((xt, t * torch.ones(xt.shape) / steps), dim=1)
-        p = torch.distributions.Normal(
-            mean_model(xin), var_model(xin)
+### Reverse Sampling
+@torch.no_grad()
+def sample_reverse(noise_model, count, steps=TIME_STEPS, device='cpu'):
+    xt = torch.randn(count, 1, 28, 28, device=device)
+
+    for t_idx in tqdm(range(steps - 1, -1, -1), desc='Sampling', leave=False):
+        t_tensor    = torch.full((count,), t_idx, device=device, dtype=torch.long)
+        eps_pred    = noise_model(xt, t_tensor)
+
+        beta_t      = betas[t_idx]
+        alpha_bar_t = alpha_bars[t_idx]
+        alpha_t     = alphas[t_idx]
+
+        # Recover the posterior mean (Bishop Eq 20.16 rearranged for ε-prediction).
+        mu = (1.0 / torch.sqrt(alpha_t)) * (
+            xt - (beta_t / torch.sqrt(1.0 - alpha_bar_t)) * eps_pred
         )
-        xt = p.sample()
-        sample_history.append(xt)
-    return sample_history
 
-samps = torch.stack(sample_reverse(mean_model, var_model, 1000))
+        if t_idx > 0:
+            xt = mu + torch.sqrt(beta_t) * torch.randn_like(xt)
+        else:
+            xt = mu
 
-for t in samps[:,:,0].T[:200]:
-    plt.plot(t, c='C%d' % int(t[-1] > 0), alpha=0.1)
-plt.xlabel('Generation time')
-plt.ylabel('Data')
-plt.show()
+    return xt
 
-sns.histplot(samps[-1, :, 0])
+### Visualise Generated Samples
+samples = sample_reverse(noise_model, 16, device=device)
+samples = (samples.clamp(-1, 1) + 1) / 2  # map [-1, 1] → [0, 1] for display
+
+grid = make_grid(samples, nrow=4)
+plt.figure(figsize=(5, 5))
+plt.imshow(grid.permute(1, 2, 0).cpu(), cmap='gray')
+plt.axis('off')
+plt.title('Generated MNIST samples')
 plt.show()
